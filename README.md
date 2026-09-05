@@ -38,6 +38,41 @@ Before running this tool, it is important to understand how Google Cloud Organiz
 4. **Automatic Field & Method Matching:**
    Different services use different label attributes (e.g. GKE uses `resource.resourceLabels` whereas GCE, GCS, Pub/Sub, and Dataproc use `resource.labels`) and supported method types (e.g. Dataproc Batch supports only `CREATE`). This tool automatically selects the correct field and method types for each service.
 
+### Constraint Definition vs. Policy Enforcement
+
+In Google Cloud, custom constraints and policy enforcement operate on two distinct layers:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ 1. Constraint DEFINITION (Catalog Rule)                                │
+│    Always registered at: organizations/{ORG_ID}/customConstraints/... │
+│    * This does NOT turn on enforcement anywhere.                       │
+│    * It simply registers the custom rule in GCP's rule catalog.        │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                Where is ENFORCEMENT activated?
+                                   │
+         ┌─────────────────────────┴─────────────────────────┐
+         ▼                                                   ▼
+┌──────────────────────────────────────┐   ┌─────────────────────────────────────┐
+│ If you pass --project <PROJECT_ID>:  │   │ If you pass ONLY --organization:    │
+│                                      │   │                                     │
+│ Enforcement:                         │   │ Enforcement:                        │
+│ projects/{PROJECT_ID}/policies/...   │   │ organizations/{ORG_ID}/policies/... │
+│                                      │   │                                     │
+│ ✅ ISOLATED to that single project.   │   │ ⚠️ ENFORCED across EVERY project     │
+│ ❌ Other projects are NOT affected.   │   │    in the entire organization.      │
+└──────────────────────────────────────┘   └─────────────────────────────────────┘
+```
+
+#### Behavior Matrix by Command
+
+| Command | Asset Discovery Scope | Constraint Definition | Policy Enforcement | Other Projects Affected? |
+| :--- | :--- | :--- | :--- | :---: |
+| `python3 enforce_org_label_policy.py --project uri-test-491314 --apply --enforce` | Project (`uri-test-491314`) | Org (`organizations/{ORG_ID}`) | **`projects/uri-test-491314`** | **NO** (Isolated) |
+| `python3 enforce_org_label_policy.py --project uri-test-491314 --scan-org --apply --enforce` | **Whole Org** (`organizations/{ORG_ID}`) | Org (`organizations/{ORG_ID}`) | **`projects/uri-test-491314`** | **NO** (Isolated) |
+| `python3 enforce_org_label_policy.py --organization <ORG_ID> --apply --enforce` | Whole Org (`organizations/{ORG_ID}`) | Org (`organizations/{ORG_ID}`) | **`organizations/{ORG_ID}`** | **YES** (All Projects) |
+
 ---
 
 ## Prerequisites
@@ -103,7 +138,7 @@ python3 enforce_org_label_policy.py \
 ```
 
 ### 2. Enforce Only for Resources Discovered via Cloud Asset Inventory
-Scans what resource types currently exist in your project or organization, filters for compatible ones, and enforces labels:
+Scans what resource types currently exist in your project, filters for compatible ones, and enforces labels:
 ```bash
 python3 enforce_org_label_policy.py \
     --project <YOUR_PROJECT_ID> \
@@ -111,7 +146,20 @@ python3 enforce_org_label_policy.py \
     --apply --enforce
 ```
 
-### 3. Dry-Run (Safe Discovery & Local YAML Generation)
+### 3. Discover Assets Across Entire Org, but Enforce on a Single Sandbox Project
+Discovers all asset types in use across the **entire organization** (`organizations/{ORG_ID}`), registers the custom constraints at the organization level, but scopes policy enforcement **strictly to your sandbox project**:
+```bash
+python3 enforce_org_label_policy.py \
+    --project <YOUR_PROJECT_ID> \
+    --scan-org \
+    --required-keys environment,cost_center,owner \
+    --apply --enforce
+
+# Then run unittests against that single project:
+python3 test_label_enforcement.py --project <YOUR_PROJECT_ID>
+```
+
+### 4. Dry-Run (Safe Discovery & Local YAML Generation)
 Discovers resource types and generates the constraint/policy YAML files locally in a temporary directory without calling GCP APIs:
 ```bash
 python3 enforce_org_label_policy.py \
@@ -120,7 +168,7 @@ python3 enforce_org_label_policy.py \
     --dry-run
 ```
 
-### 4. Enforce on Specific Resources
+### 5. Enforce on Specific Resources
 Target specific resource types explicitly:
 ```bash
 python3 enforce_org_label_policy.py \
@@ -130,7 +178,7 @@ python3 enforce_org_label_policy.py \
     --apply --enforce
 ```
 
-### 5. Enforce Organization-Wide
+### 6. Enforce Organization-Wide
 Enforce mandatory labels across **all projects** in the organization:
 ```bash
 python3 enforce_org_label_policy.py \
@@ -140,7 +188,7 @@ python3 enforce_org_label_policy.py \
     --apply --enforce
 ```
 
-### 6. Cleanup / Rollback
+### 7. Cleanup / Rollback
 Deletes all custom constraints and project policies created by this script (matching prefix `custom.reqLabels*`):
 ```bash
 python3 enforce_org_label_policy.py \
@@ -165,6 +213,8 @@ python3 enforce_org_label_policy.py \
 | `--enforce` | Applies the enforcing policy (`enforce: true`) to the target project (or organization). Implies `--apply`. |
 | `--cleanup` | Deletes all policies and custom constraints created by this script. |
 | `-v, --verbose` | Print all incompatible/unsupported resource types in full (default is condensed). |
+| `--scan-org` | Scan Cloud Asset Inventory across the **entire organization** to discover all assets, but enforce policies strictly on the project specified by `--project`. |
+| `--cai-scope <SCOPE>` | Explicit scope for Cloud Asset Inventory discovery (e.g. `organizations/123`, `folders/456`, or `projects/xyz`). |
 
 ---
 

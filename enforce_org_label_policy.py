@@ -361,6 +361,12 @@ def main():
                       help="Delete policies/constraints created by this script.")
   parser.add_argument("-v", "--verbose", action="store_true",
                       help="Print all incompatible/unsupported resources in full (by default, condensed).")
+  parser.add_argument("--scan-org", action="store_true",
+                      help="Scan Cloud Asset Inventory across the ENTIRE organization to discover "
+                           "all asset types in use, but enforce policies only on the project specified by --project.")
+  parser.add_argument("--cai-scope", default=None,
+                      help="Explicit scope for Cloud Asset Inventory discovery "
+                           "(e.g. 'organizations/123', 'folders/456', or 'projects/xyz').")
   args = parser.parse_args()
 
   if not args.project and not args.organization:
@@ -389,16 +395,26 @@ def main():
     print("Neither --apply nor --dry-run specified; defaulting to --dry-run.")
     args.dry_run = True
 
-  if args.project:
+  # Determine CAI scan scope (defaults to project if --project is passed, unless --scan-org is requested)
+  if args.cai_scope:
+    cai_scope = args.cai_scope.strip()
+  elif args.scan_org:
+    cai_scope = f"organizations/{org_id}"
+  elif args.project:
     cai_scope = f"projects/{args.project}"
+  else:
+    cai_scope = f"organizations/{org_id}"
+
+  if args.project:
     policy_target = f"projects/{args.project}"
     print(f"==> Target Project      : {args.project}")
     print(f"==> Parent Organization : {org_id}")
+    print(f"==> CAI Scan Scope      : {cai_scope}")
     print(f"==> Policy Target       : {policy_target} (isolated to {args.project}!)")
   else:
-    cai_scope = f"organizations/{org_id}"
     policy_target = f"organizations/{org_id}"
     print(f"==> Target Organization : {org_id}")
+    print(f"==> CAI Scan Scope      : {cai_scope}")
     print(f"==> Policy Target       : {policy_target} (org-wide)")
 
   out_dir = args.output_dir or tempfile.mkdtemp(prefix="label_policies_")
