@@ -12,27 +12,32 @@ GCP ARCHITECTURAL RULES:
   3. Cloud Asset Inventory can be scoped to either the whole organization OR
      specifically to your project (`projects/{PROJECT_ID}`) to find only the
      resource types actually in use.
+  4. Alternatively, `--all-supported` enforces policies across all known
+     label-compatible GCP resource types regardless of whether they currently exist in CAI.
 
-LIMITATIONS:
-  * A custom constraint can target EXACTLY ONE resource type (hard GCP limit).
-  * Only resource types onboarded to Custom Org Policy that expose `resource.labels`
-    in their CEL schema can be enforced. Unsupported types are gracefully skipped.
+ALL VERIFIED COMPATIBLE RESOURCE TYPES (from Google Cloud CuOP CEL Schemas):
+  * pubsub.googleapis.com/Topic       (field: resource.labels, methods: CREATE, UPDATE)
+  * pubsub.googleapis.com/Subscription(field: resource.labels, methods: CREATE, UPDATE)
+  * pubsub.googleapis.com/Snapshot    (field: resource.labels, methods: CREATE, UPDATE)
+  * storage.googleapis.com/Bucket     (field: resource.labels, methods: CREATE, UPDATE)
+  * compute.googleapis.com/Instance   (field: resource.labels, methods: CREATE, UPDATE)
+  * dataproc.googleapis.com/Cluster   (field: resource.labels, methods: CREATE, UPDATE)
+  * dataproc.googleapis.com/Batch     (field: resource.labels, methods: CREATE)
+  * container.googleapis.com/Cluster  (field: resource.resourceLabels, methods: CREATE, UPDATE)
 
 Usage examples:
-  # 1. Dry-run against a project (writes YAMLs locally, no cloud changes):
-  python3 enforce_org_label_policy.py --project my-project-id --dry-run
-
-  # 2. Apply custom constraints to the parent org, but ENFORCE ONLY on the project:
-  python3 enforce_org_label_policy.py --project my-project-id --apply --enforce
-
-  # 3. Require specific mandatory label keys:
+  # 1. Discover resources in use via Cloud Asset Inventory and enforce compatible ones:
   python3 enforce_org_label_policy.py --project my-project-id --apply --enforce \
       --required-keys environment,cost_center,owner
 
-  # 4. Org-wide enforcement (applies to all projects in the org):
-  python3 enforce_org_label_policy.py --organization 123456789012 --apply --enforce
+  # 2. Enforce across all supported resource types on a sandbox project:
+  python3 enforce_org_label_policy.py --project my-project-id --all-supported --apply --enforce \
+      --required-keys environment,cost_center,owner
 
-  # 5. Cleanup policies and constraints created by this script:
+  # 3. Dry-run against a project:
+  python3 enforce_org_label_policy.py --project my-project-id --dry-run
+
+  # 4. Clean up all created constraints and policies:
   python3 enforce_org_label_policy.py --project my-project-id --cleanup
 """
 
@@ -47,10 +52,53 @@ import tempfile
 MAX_SHORT_NAME_LEN = 62
 CONSTRAINT_PREFIX = "custom.reqLabels"
 
+# Authoritative registry of all GCP resource types supporting Custom Org Policy label enforcement
+SUPPORTED_RESOURCE_TYPES = {
+    "pubsub.googleapis.com/Topic": {
+        "field": "labels",
+        "method_types": ["CREATE", "UPDATE"],
+        "display_name": "Pub/Sub Topics",
+    },
+    "pubsub.googleapis.com/Subscription": {
+        "field": "labels",
+        "method_types": ["CREATE", "UPDATE"],
+        "display_name": "Pub/Sub Subscriptions",
+    },
+    "pubsub.googleapis.com/Snapshot": {
+        "field": "labels",
+        "method_types": ["CREATE", "UPDATE"],
+        "display_name": "Pub/Sub Snapshots",
+    },
+    "storage.googleapis.com/Bucket": {
+        "field": "labels",
+        "method_types": ["CREATE", "UPDATE"],
+        "display_name": "Cloud Storage Buckets",
+    },
+    "compute.googleapis.com/Instance": {
+        "field": "labels",
+        "method_types": ["CREATE", "UPDATE"],
+        "display_name": "Compute Engine VM Instances",
+    },
+    "dataproc.googleapis.com/Cluster": {
+        "field": "labels",
+        "method_types": ["CREATE", "UPDATE"],
+        "display_name": "Dataproc Clusters",
+    },
+    "dataproc.googleapis.com/Batch": {
+        "field": "labels",
+        "method_types": ["CREATE"],
+        "display_name": "Dataproc Batches",
+    },
+    "container.googleapis.com/Cluster": {
+        "field": "resourceLabels",
+        "method_types": ["CREATE", "UPDATE"],
+        "display_name": "GKE Clusters",
+    },
+}
+
 
 def run(cmd, check=True, capture=True):
   """Run a shell command, returning (returncode, stdout, stderr)."""
-  # Inject --quiet into gcloud commands if not already present
   if cmd and cmd[0] == "gcloud" and "--quiet" not in cmd:
     cmd = [cmd[0], "--quiet"] + cmd[1:]
   print(f"  $ {' '.join(cmd)}")
@@ -66,6 +114,17 @@ def run(cmd, check=True, capture=True):
         f"STDERR: {proc.stderr}"
     )
   return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+
+
+def format_condensed_list(items, max_items=5):
+  """Format a list of strings into a condensed single-line summary."""
+  if not items:
+    return "None"
+  if len(items) <= max_items:
+    return ", ".join(items)
+  shown = ", ".join(items[:max_items])
+  remaining = len(items) - max_items
+  return f"{shown}, ... (+{remaining} more)"
 
 
 def resolve_parent_org(project_id, explicit_org=None):
@@ -141,15 +200,15 @@ def make_short_name(asset_type):
   return short[:MAX_SHORT_NAME_LEN + len("custom.")]
 
 
-def build_condition(required_keys):
+def build_condition(required_keys, field="labels"):
   """Build the CEL condition enforcing presence of labels.
 
   actionType is ALLOW, so the resource is allowed ONLY when the condition holds.
   """
   if required_keys:
-    clauses = [f"'{k}' in resource.labels" for k in required_keys]
+    clauses = [f"'{k}' in resource.{field}" for k in required_keys]
     return " && ".join(clauses)
-  return "resource.labels.size() > 0"
+  return f"resource.{field}.size() > 0"
 
 
 def build_constraint_yaml(organization, short_name, asset_type, condition, method_types=None):
@@ -193,8 +252,8 @@ def write_file(directory, filename, content):
 
 def parse_error_reason(stderr):
   """Extract a clean, human-readable reason from gcloud's error output."""
-  if "undefined field 'labels'" in stderr:
-    return "CEL schema does not have a 'labels' field"
+  if "undefined field 'labels'" in stderr or "undefined field 'resourceLabels'" in stderr:
+    return "CEL schema does not have the specified label field"
   if "INVALID_CUSTOM_CONSTRAINT_RESOURCE_TYPE" in stderr or "Invalid custom constraint resource type" in stderr:
     return "Resource type not onboarded to Custom Org Policy"
   m = re.search(r"description:\s*(.+)", stderr)
@@ -215,7 +274,7 @@ def set_custom_constraint(path, organization, short_name, asset_type, condition,
     return True, ""
 
   # If UPDATE is not supported, retry with CREATE only
-  if "Method type `UPDATE` is not supported" in stderr:
+  if "Method type `UPDATE` is not supported" in stderr or "Method type 'UPDATE' is not supported" in stderr:
     print("    Retrying with methodTypes=[CREATE] only ...")
     create_only_yaml = build_constraint_yaml(
         organization, short_name, asset_type, condition, method_types=["CREATE"]
@@ -277,9 +336,15 @@ def main():
                       help="Target a specific GCP Project ID. Scopes asset search "
                            "and policy enforcement to this project.")
   parser.add_argument("--organization", default=None,
-                      help="Numeric GCP organization ID (e.g. 123456789012). "
+                      help="Numeric GCP organization ID (e.g. 727867939640). "
                            "Required for constraint registration. Auto-detected if "
                            "--project is supplied.")
+  parser.add_argument("--all-supported", action="store_true",
+                      help="Target all verified label-compatible resource types "
+                           "without needing prior discovery via CAI.")
+  parser.add_argument("--resources", default="",
+                      help="Comma-separated list of explicit resource types to target "
+                           "(e.g. pubsub.googleapis.com/Topic,compute.googleapis.com/Instance).")
   parser.add_argument("--required-keys", default="",
                       help="Comma-separated label keys that must be present. "
                            "If omitted, requires at least one label of any kind.")
@@ -294,6 +359,8 @@ def main():
                       help="Only discover types and generate YAML locally; no cloud changes.")
   parser.add_argument("--cleanup", action="store_true",
                       help="Delete policies/constraints created by this script.")
+  parser.add_argument("-v", "--verbose", action="store_true",
+                      help="Print all incompatible/unsupported resources in full (by default, condensed).")
   args = parser.parse_args()
 
   if not args.project and not args.organization:
@@ -327,13 +394,11 @@ def main():
     policy_target = f"projects/{args.project}"
     print(f"==> Target Project      : {args.project}")
     print(f"==> Parent Organization : {org_id}")
-    print(f"==> CAI Scan Scope      : {cai_scope}")
     print(f"==> Policy Target       : {policy_target} (isolated to {args.project}!)")
   else:
     cai_scope = f"organizations/{org_id}"
     policy_target = f"organizations/{org_id}"
     print(f"==> Target Organization : {org_id}")
-    print(f"==> CAI Scan Scope      : {cai_scope}")
     print(f"==> Policy Target       : {policy_target} (org-wide)")
 
   out_dir = args.output_dir or tempfile.mkdtemp(prefix="label_policies_")
@@ -341,22 +406,56 @@ def main():
   print(f"==> Output directory    : {out_dir}")
 
   required_keys = [k.strip() for k in args.required_keys.split(",") if k.strip()]
-  condition = build_condition(required_keys)
-  print(f"==> CEL Condition       : {condition}")
+  print(f"==> Required label keys : {required_keys or ['(any label)']}")
 
-  asset_types = discover_asset_types(cai_scope)
+  incompatible_discovered = []
+  if args.all_supported:
+    target_types = list(SUPPORTED_RESOURCE_TYPES.keys())
+    print(f"==> Targeting all {len(target_types)} verified compatible resource types.")
+  elif args.resources:
+    target_types = [r.strip() for r in args.resources.split(",") if r.strip()]
+    print(f"==> Targeting {len(target_types)} explicitly specified resource types.")
+  else:
+    discovered_types = discover_asset_types(cai_scope)
+    target_types = [t for t in discovered_types if t in SUPPORTED_RESOURCE_TYPES]
+    incompatible_discovered = [t for t in discovered_types if t not in SUPPORTED_RESOURCE_TYPES]
+
+    print(f"\n==> Discovery Breakdown ({len(discovered_types)} total asset types found in inventory):")
+    print(f"    ✔ Compatible Resources ({len(target_types)}):")
+    if target_types:
+      for t in target_types:
+        meta = SUPPORTED_RESOURCE_TYPES[t]
+        methods_str = ", ".join(meta["method_types"])
+        print(f"      • {t:<38} (field: resource.{meta['field']}, methods: {methods_str})")
+    else:
+      print("      • (none currently provisioned in scope)")
+
+    if args.verbose:
+      print(f"    ✖ Incompatible Resources ({len(incompatible_discovered)}):")
+      for t in incompatible_discovered:
+        print(f"      • {t}")
+    else:
+      print(f"    ✖ Incompatible Resources ({len(incompatible_discovered)}): "
+            f"{format_condensed_list(incompatible_discovered)}")
+    print()
 
   created, skipped = [], []
-  for asset_type in asset_types:
+  for asset_type in target_types:
     short_name = make_short_name(asset_type)
+    res_info = SUPPORTED_RESOURCE_TYPES.get(asset_type, {})
+    field_name = res_info.get("field", "labels")
+    methods = res_info.get("method_types", ["CREATE", "UPDATE"])
+    condition = build_condition(required_keys, field=field_name)
+
     constraint_yaml = build_constraint_yaml(
-        org_id, short_name, asset_type, condition)
+        org_id, short_name, asset_type, condition, method_types=methods
+    )
     c_path = write_file(out_dir, f"{short_name}.constraint.yaml", constraint_yaml)
 
     if args.dry_run:
       policy_yaml = build_policy_yaml(policy_target, short_name)
       write_file(out_dir, f"{short_name}.policy.yaml", policy_yaml)
-      print(f"  [dry-run] Generated constraint + policy for {asset_type}")
+      print(f"  [dry-run] Generated constraint + policy for {asset_type} ({field_name})")
       created.append((asset_type, short_name))
       continue
 
@@ -381,13 +480,24 @@ def main():
 
   # Summary
   print("\n================ SUMMARY ================")
-  print(f"Total asset types in scope   : {len(asset_types)}")
-  print(f"Constraints created/generated: {len(created)}")
-  print(f"Skipped (unsupported)        : {len(skipped)}")
+  print(f"Compatible resources processed : {len(target_types)}")
+  print(f"Constraints created/generated  : {len(created)}")
+  for asset_type, short_name in created:
+    print(f"  ✔ {asset_type:<38} -> {short_name}")
+
+  if incompatible_discovered:
+    print(f"\nIncompatible resources in CAI ({len(incompatible_discovered)} skipped):")
+    if args.verbose:
+      for t in incompatible_discovered:
+        print(f"  ✖ {t}")
+    else:
+      print(f"  ✖ {format_condensed_list(incompatible_discovered)}")
+
   if skipped:
-    print("\nSkipped resource types:")
+    print(f"\nFailed / Rejected by API ({len(skipped)}):")
     for t, r in skipped:
-      print(f"  - {t}  ({r})")
+      print(f"  ! {t}  ({r})")
+
   print(f"\nGenerated YAMLs are in: {out_dir}")
   if args.dry_run:
     target_flag = f"--project {args.project}" if args.project else f"--organization {org_id}"
