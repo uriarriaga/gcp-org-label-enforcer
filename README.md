@@ -40,13 +40,38 @@ Before running this tool, it is important to understand how Google Cloud Organiz
 
 ---
 
-## Quickstart & Usage
+## Quickstart: Running in GCP Cloud Shell
+
+Cloud Shell has direct internet access to GitHub and comes with `python3` and `gcloud` pre-installed and authenticated:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/uriarriaga/gcp-org-label-enforcer.git
+cd gcp-org-label-enforcer
+
+# 2. Set your active project and enable required APIs
+gcloud config set project uri-test-491314
+gcloud services enable cloudasset.googleapis.com orgpolicy.googleapis.com
+
+# 3. Dry-Run (safe, generates YAMLs locally without cloud changes)
+python3 enforce_org_label_policy.py --project uri-test-491314 --dry-run
+
+# 4. Apply & Enforce on uri-test-491314
+python3 enforce_org_label_policy.py --project uri-test-491314 --apply --enforce
+
+# 5. Cleanup when finished testing
+python3 enforce_org_label_policy.py --project uri-test-491314 --cleanup
+```
+
+---
+
+## Detailed Usage Options
 
 ### 1. Dry-Run (Safe Discovery & Local YAML Generation)
 Discover all resource types in your project and generate the constraint/policy YAML files locally without making any cloud changes:
 ```bash
 python3 enforce_org_label_policy.py \
-    --project <YOUR_PROJECT_ID> \
+    --project uri-test-491314 \
     --dry-run
 ```
 
@@ -115,3 +140,25 @@ Details: Resources of type storage.googleapis.com/Bucket must have the required 
 $ gcloud pubsub topics create my-topic --project=<YOUR_PROJECT_ID> --labels=environment=dev
 Created topic [projects/<YOUR_PROJECT_ID>/topics/my-topic].
 ```
+
+---
+
+## Automated Unit & Integration Tests
+
+The repository includes an automated test suite ([`test_label_enforcement.py`](./test_label_enforcement.py)) using Python's built-in `unittest` framework to automatically verify enforcement on all compatible resource types:
+
+- **`TestPubSubTopic`**: Verifies unlabelled topic creation is rejected, and compliant topic creation succeeds and is deleted.
+- **`TestStorageBucket`**: Verifies unlabelled bucket creation is rejected (HTTP 412), and compliant bucket creation succeeds and is deleted.
+- **`TestComputeInstance`**: Verifies unlabelled VM instance creation is rejected, and compliant VM creation succeeds and is deleted.
+
+### Running the Tests:
+```bash
+# Run all tests against your target project:
+python3 test_label_enforcement.py --project <YOUR_PROJECT_ID>
+
+# Or run tests for a specific resource type:
+python3 test_label_enforcement.py --project <YOUR_PROJECT_ID> TestPubSubTopic
+python3 test_label_enforcement.py --project <YOUR_PROJECT_ID> TestStorageBucket
+python3 test_label_enforcement.py --project <YOUR_PROJECT_ID> TestComputeInstance
+```
+
